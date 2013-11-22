@@ -437,10 +437,12 @@ let main_loop control =
     | Command (HttpPut(filename, url)) ->
         begin
           try_lwt
+            lwt () =
+              if not (Sys.file_exists filename)
+              then fail (ClientSideError (Printf.sprintf "file '%s' does not exist" filename))
+              else return () in
             let rec doit url =
               let server, path = parse_url url in
-              if not (Sys.file_exists filename) then
-                raise (ClientSideError (Printf.sprintf "file '%s' does not exist" filename));
               lwt fd = Lwt_unix.openfile filename [ Unix.O_RDONLY ] 0o0 in
               lwt stats = Lwt_unix.LargeFile.stat filename in
               let file_size = stats.Lwt_unix.LargeFile.st_size in
@@ -486,6 +488,10 @@ let main_loop control =
     | Command (HttpGet(filename, url)) ->
         begin
           try_lwt
+            lwt () =
+                if Sys.file_exists filename
+                then fail (ClientSideError (Printf.sprintf "file '%s' already exists" filename))
+                else return () in
             let rec doit url =
               let server, path = parse_url url in
               debug "Opening connection to server '%s' path '%s'\n%!" server path;

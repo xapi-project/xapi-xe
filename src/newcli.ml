@@ -478,7 +478,8 @@ let main_loop control =
                   end
                 | _ -> failwith "Unhandled response code"
               end in
-            doit url
+            lwt () = doit url in
+            marshal control (Response OK)
           with
           | ClientSideError msg ->
               lwt () = marshal control (Response Failed) in
@@ -530,7 +531,8 @@ let main_loop control =
                 | _ -> failwith "Unhandled response code"
               end
             in
-            doit url
+            lwt () = doit url in
+            marshal control (Response OK)
           with
           | ClientSideError msg ->
               lwt () = marshal control (Response Failed) in

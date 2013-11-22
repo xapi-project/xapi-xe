@@ -441,7 +441,7 @@ let main_loop control =
         return ();
       | None -> return ())
     | Command (HttpPut(filename, url)) ->
-        begin
+        let _ =
           try_lwt
             lwt () =
               if not (Sys.file_exists filename)
@@ -490,10 +490,10 @@ let main_loop control =
               debug "HttpPut failure: %s\n%!" (Printexc.to_string e);
               (* Assume the server will figure out what's wrong and tell us over
                  the normal communication channel *)
-              marshal control (Response Failed)
-        end
+              marshal control (Response Failed) in
+        return ()
     | Command (HttpGet(filename, url)) ->
-        begin
+        let _ =
           try_lwt
             lwt () =
                 if Sys.file_exists filename
@@ -541,8 +541,8 @@ let main_loop control =
               return ()
           | e ->
               debug "HttpGet failure: %s\n%!" (Printexc.to_string e);
-              marshal control (Response Failed)
-        end
+              marshal control (Response Failed) in
+        return ()
     | Command Prompt ->
         let data = input_line stdin in
         lwt () = marshal control (Blob (Chunk (Int32.of_int (String.length data)))) in

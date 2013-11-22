@@ -1,3 +1,4 @@
 trunk (unreleased)
 * Initial import from xen-api c/s 11db05966a1e79275405a089e4221d208bc2778b 
-
+* Now links against libssl directly (via Lwt_ssl) rather than using
+  stunnel

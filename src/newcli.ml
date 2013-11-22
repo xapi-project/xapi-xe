@@ -255,14 +255,14 @@ let open_channels () =
     open_tcp !xapiserver
 
 let copy_with_heartbeat in_ch out_ch heartbeat_fun =
-  let buffer = Cstruct.create (16 * 1024 * 1024) in
+  let buffer = Cstruct.create (16 * 1024) in
   let copy_thread =
     let rec loop () =
       lwt input = in_ch.Channels.read buffer in
       if Cstruct.len input = 0
       then return ()
       else
-        lwt () = out_ch.Channels.really_write buffer in
+        lwt () = out_ch.Channels.really_write input in
         loop () in
     loop () in
   let heartbeat_thread =

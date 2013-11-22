@@ -446,7 +446,7 @@ let main_loop control =
               let file_size = stats.Lwt_unix.LargeFile.st_size in
               lwt c = open_tcp server in
 
-              let headers = Header.of_list [ "Content-length", Int64.to_string file_size ] in
+              let headers = Header.of_list [ "content-length", Int64.to_string file_size ] in
               let request = Cohttp.Request.make ~meth:`PUT ~version:`HTTP_1_0 ~headers (Uri.of_string url) in
               Request.write (fun t _ -> return ()) request c >>= fun () ->
               Response.read (Cohttp_unbuffered_io.make_input c) >>= fun r ->
@@ -567,23 +567,13 @@ let main () : unit Lwt.t =
       open_channels () >>= fun c ->
       let headers = Header.init () in
       let headers = Header.add headers "User-agent" (Printf.sprintf "xe-cli/Unix/%d.%d" major minor) in
-      let headers = Header.add headers "Content-length" (string_of_int (String.length body)) in
+      let headers = Header.add headers "content-length" (string_of_int (String.length body)) in
       let request = Cohttp.Request.make ~meth:`POST ~version:`HTTP_1_0 ~headers (Uri.make ~path:"/cli" ()) in
-      Request.write (fun t _ -> return ()) request c >>= fun () ->
-      Response.read (Cohttp_unbuffered_io.make_input c) >>= fun r ->
-      begin match r with
-      | None -> fail (Failure "Unable to parse HTTP response from server")
-      | Some x ->
-        let code = Code.code_of_status (Cohttp.Response.status x) in
-        if Code.is_success code then begin
-          lwt status = main_loop c in
-          exit_status := status;
-          return ()
-        end else begin
-          exit_status := 1;
-          return ()
-        end
-      end;
+      Request.write (fun t oc -> Request.write_body t oc body) request c >>= fun () ->
+      (* NB: there is no HTTP response normally *)
+      lwt status = main_loop c in
+      exit_status := status;
+      return ()
     end
   with
   | Usage ->

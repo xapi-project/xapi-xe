@@ -16,7 +16,12 @@
    commands to execute locally (print this string, ask this question,
    upload this file) *)
 
+open Lwt
+
 open Cli_protocol
+open Cohttp
+module Request = Request.Make(Cohttp_unbuffered_io)
+module Response = Response.Make(Cohttp_unbuffered_io)
 
 (* Param config priorities:
    explicit cmd option > XE_XXX env variable > ~/.xe rc file > default
@@ -66,35 +71,6 @@ let startswith prefix x =
   let x' = String.length x in
   x' >= prefix' && (String.sub x 0 prefix' = prefix)
 
-(* HTTP level bits and pieces *)
-
-exception Http_parse_failure
-let hdrs = ["content-length"; "cookie"; "connection"; "transfer-encoding"; "authorization"; "location"]
-
-let end_of_string s from =
-  String.sub s from ((String.length s)-from)
-
-let strip_cr r =
-  if String.length r=0 then raise Http_parse_failure;
-  let last_char = String.sub r ((String.length r)-1) 1 in
-  if last_char <> "\r" then raise Http_parse_failure;
-  String.sub r 0 ((String.length r)-1)
-
-let rec read_rest_of_headers ic =
-  try
-    let r = input_line ic in
-    let r = strip_cr r in
-    if r="" then [] else
-      begin
-        debug "read '%s'\n" r;
-        let hdr = List.find (fun s -> startswith (s^": ") (String.lowercase r)) hdrs in
-        let value = end_of_string r (String.length hdr + 2) in
-        (hdr,value)::read_rest_of_headers ic
-      end
-  with
-  | Not_found -> read_rest_of_headers ic
-  | _ -> []
-
 let parse_url url =
   let uri = Uri.of_string url in
   match Uri.scheme uri, Uri.host uri with
@@ -128,21 +104,19 @@ let parse_port (x: string) =
     raise Usage
 
 let filter_chars s valid =
-        let badchars = ref false in
-        let buf = Buffer.create 0 in
-        for i = 0 to String.length s - 1
-        do
-                if !badchars then (
-                        if valid s.[i] then
-                                Buffer.add_char buf s.[i]
-                ) else (
-                        if not (valid s.[i]) then (
-                                Buffer.add_substring buf s 0 i;
-                                badchars := true
-                        )
-                )
-        done;
-        if !badchars then Buffer.contents buf else s
+  let badchars = ref false in
+  let buf = Buffer.create 0 in
+  for i = 0 to String.length s - 1 do
+    if !badchars then (
+      if valid s.[i] then Buffer.add_char buf s.[i]
+    ) else (
+      if not (valid s.[i]) then (
+      Buffer.add_substring buf s 0 i;
+      badchars := true
+      )
+    )
+  done;
+  if !badchars then Buffer.contents buf else s
 
 (* Extract the arguments we're interested in. Return a list of the argumets we know *)
 (* nothing about. These will get passed straight into the server *)
@@ -244,51 +218,59 @@ let parse_args =
       end in
     args_rest @ extras_rest @ rcs_rest @ !reserve_args
 
-let open_tcp_ssl server =
-  failwith "ssl not implemented"
+let socket sockaddr =
+  let family = match sockaddr with
+  | Lwt_unix.ADDR_INET(_, _) -> Unix.PF_INET
+  | Lwt_unix.ADDR_UNIX _ -> Unix.PF_UNIX in
+  Lwt_unix.socket family Unix.SOCK_STREAM 0
 
-let open_tcp server =
-  if !xeusessl && not(is_localhost server) then (* never use SSL on-host *)
-    open_tcp_ssl server
-  else (
-    let host = Unix.gethostbyname server in
-    let addr = host.Unix.h_addr_list.(0) in
-    Unix.open_connection (Unix.ADDR_INET (addr,get_xapiport false))
-  )
+let open_tcp_ssl host =
+  Lwt_unix.gethostbyname host >>= fun host_entry ->
+  let sockaddr = Lwt_unix.ADDR_INET(host_entry.Lwt_unix.h_addr_list.(0), get_xapiport true) in
+  let sock = socket sockaddr in
+  Lwt_unix.connect sock sockaddr >>= fun () ->
+  Channels.of_ssl_fd sock
+
+let open_tcp host =
+  if !xeusessl && not(is_localhost host) then (* never use SSL on-host *)
+    open_tcp_ssl host
+  else begin
+    Lwt_unix.gethostbyname host >>= fun host_entry ->
+    let sockaddr = Lwt_unix.ADDR_INET(host_entry.Lwt_unix.h_addr_list.(0), get_xapiport false) in
+    let sock = socket sockaddr in
+    Lwt_unix.connect sock sockaddr >>= fun () ->
+    Channels.of_raw_fd sock
+  end
 
 let open_channels () =
-  if is_localhost !xapiserver then (
-    try
-      Unix.open_connection (Unix.ADDR_UNIX (Filename.concat "/var/lib/xcp" "xapi"))
+  if is_localhost !xapiserver then begin
+    try_lwt
+      let sockaddr = Lwt_unix.ADDR_UNIX (Filename.concat "/var/lib/xcp" "xapi") in
+      let sock = socket sockaddr in
+      Lwt_unix.connect sock sockaddr >>= fun () ->
+      Channels.of_raw_fd sock
     with _ ->
       open_tcp !xapiserver
-  ) else
+  end else
     open_tcp !xapiserver
 
-let space = Re_str.regexp_string " "
-
-let http_response_code x = match Re_str.split space x with
-  | _ :: code :: _ -> int_of_string code
-  | _ -> failwith "Bad response from HTTP server"
-
-let copy_with_heartbeat ?(block=65536) in_ch out_ch heartbeat_fun =
-	let buf = String.make block '\000' in
-	let last_heartbeat = ref (Unix.time()) in
-	let finish = ref false in
-	while not !finish do
-		let bytes = input in_ch buf 0 block in
-		if bytes <> 0 then
-			output out_ch buf 0 bytes
-		else begin
-			flush out_ch;
-			finish := true
-		end;
-		let now = Unix.time () in
-		if now -. !last_heartbeat >= heartbeat_interval then begin
-			heartbeat_fun ();
-			last_heartbeat := now
-		end
-	done
+let copy_with_heartbeat in_ch out_ch heartbeat_fun =
+  let buffer = Cstruct.create (16 * 1024 * 1024) in
+  let copy_thread =
+    let rec loop () =
+      lwt input = in_ch.Channels.read buffer in
+      if Cstruct.len input = 0
+      then return ()
+      else
+        lwt () = out_ch.Channels.really_write buffer in
+        loop () in
+    loop () in
+  let heartbeat_thread =
+    while_lwt true do
+      lwt () = Lwt_unix.sleep heartbeat_interval in
+      heartbeat_fun ()
+    done in
+  Lwt.pick [ copy_thread; heartbeat_thread ]
 
 exception Http_failure
 exception Connect_failure
@@ -297,353 +279,348 @@ exception ClientSideError of string
 exception Unexpected_msg of message
 exception Server_internal_error
 
-let handle_unmarshal_failure ex ifd = match ex with
-	| Unmarshal_failure (e, s) ->
-		let s = s ^ Unixext.try_read_string ifd in
-		debug "Read: %s\n" s;
-		if String.length s >= 4 && String.uppercase (String.sub s 0 4) = "HTTP"
-		then raise Server_internal_error
-		else raise e
-	| e -> raise e
+let handle_unmarshal_failure ex c = match ex with
+  | Unmarshal_failure (e, s) ->
+    debug "Read: %s\n" s;
+    if String.length s >= 4 && String.uppercase (String.sub s 0 4) = "HTTP"
+    then fail Server_internal_error
+    else fail e
+  | e -> fail e
 
-let main_loop ifd ofd =
+let main_loop control =
   (* Intially exchange version information *)
-  let major', minor' =
-	  try unmarshal_protocol ifd with
-	  | Unmarshal_failure (_, "") -> raise Connect_failure
-	  | e -> handle_unmarshal_failure e ifd in
+  lwt major', minor' =
+    try_lwt unmarshal_protocol control with
+    | Unmarshal_failure (_, "") -> fail Connect_failure
+    | e -> handle_unmarshal_failure e control in
   let msg = Printf.sprintf "Server has protocol version %d.%d. Client has %d.%d" major' minor' major minor in
   debug "%s\n%!" msg;
-  if major' <> major
-  then raise (Protocol_version_mismatch msg);
+  lwt () =
+    if major' <> major
+    then fail (Protocol_version_mismatch msg)
+    else return () in
   let with_heartbeat =
-	  major' * 10 + minor' >= int_of_float (heartbeat_version *. 10.) in
+    major' * 10 + minor' >= int_of_float (heartbeat_version *. 10.) in
   let heartbeat_fun =
-	  if with_heartbeat then (fun () -> marshal ofd (Response Wait))
-	  else ignore in
-  marshal_protocol ofd;
+    if with_heartbeat
+    then (fun () -> marshal control (Response Wait))
+    else (fun () -> return ()) in
+  lwt () = marshal_protocol control in
 
   let exit_code = ref None in
-  while !exit_code = None do
-    (* Wait for input asynchronously so that we can check the status
-       of Stunnel every now and then, for better debug/dignosis.
-    *)
-    while (match Unix.select [ifd] [] [] 5.0 with
-           | _ :: _, _, _ -> false
-           | _ -> true) do ()
-    done;
-	  let cmd =
-		  try unmarshal ifd
-		  with e -> handle_unmarshal_failure e ifd in
+  lwt () = while_lwt !exit_code = None do
+    lwt cmd = try_lwt unmarshal control
+              with e -> handle_unmarshal_failure e control in
     debug "Read: %s\n%!" (string_of_message cmd); flush stderr;
     match cmd with
-    | Command (Print x) -> print_endline x; flush stdout
-    | Command (PrintStderr x) -> Printf.fprintf stderr "%s%!" x
-    | Command (Debug x) -> debug "debug from server: %s\n%!" x
+    | Command (Print x) -> print_endline x; flush stdout; return ()
+    | Command (PrintStderr x) -> Printf.fprintf stderr "%s%!" x; return ()
+    | Command (Debug x) -> debug "debug from server: %s\n%!" x; return ()
     | Command (Load x) ->
         begin
-          try
-            let fd = Unix.openfile x [ Unix.O_RDONLY ] 0 in
-            marshal ofd (Response OK);
+          try_lwt
+            lwt fd = Lwt_unix.openfile x [ Unix.O_RDONLY ] 0 in
+            lwt file = Channels.of_raw_fd fd in
+            lwt () = marshal control (Response OK) in
             let length = (Unix.stat x).Unix.st_size in
-            marshal ofd (Blob (Chunk (Int32.of_int length)));
-            let buffer = String.make (1024 * 1024 * 10) '\000' in
-            let left = ref length in
-            while !left > 0 do
-              let n = Unix.read fd buffer 0 (min (String.length buffer) !left) in
-              Unixext.really_write ofd buffer 0 n;
-              left := !left - n
-            done;
-            marshal ofd (Blob End);
-            Unix.close fd
+            lwt () = marshal control (Blob (Chunk (Int32.of_int length))) in
+            let buffer = Cstruct.create (16 * 1024 * 1024) in
+            let rec loop remaining =
+              if remaining <= 0L
+              then return ()
+              else
+                let size = Int64.(to_int (min remaining (of_int (Cstruct.len buffer)))) in
+                let fragment = Cstruct.sub buffer 0 size in
+                lwt () = file.Channels.really_read fragment in
+                lwt () = control.Channels.really_write fragment in
+                let remaining = Int64.(sub remaining (of_int size)) in
+                loop remaining in
+            lwt () = loop (Int64.of_int length) in
+            lwt () = marshal control (Blob End) in
+            file.Channels.close ()
           with
-          | e -> marshal ofd (Response Failed)
+          | e -> marshal control (Response Failed)
         end
     | Command (HttpConnect(url)) ->
-	      let server, path = parse_url url in
-	      (* The releatively complex design here helps to buffer input/output
-	         when the underlying connection temporarily breaks, hence provides
-	         seemingly continous connection. *)
-	      let block = 65536 in
-	      let buf_local = String.make block '\000' in
-	      let buf_local_end = ref 0 in
-	      let buf_local_start = ref 0 in
-	      let buf_remote = String.make block '\000' in
-	      let buf_remote_end = ref 0 in
-	      let buf_remote_start = ref 0 in
-	      let final = ref false in
-	      let tc_save = ref None in
-	      let connection ic oc =
-		      let fd = Unix.descr_of_out_channel oc in
-		      Printf.fprintf oc "CONNECT %s HTTP/1.0\r\ncontent-length: 0\r\n\r\n" path;
-		      flush oc;
-		      let resultline = input_line ic in
-		      let _ = read_rest_of_headers ic in
-		      (* Get the result header immediately *)
-		      begin match http_response_code resultline with
-		      | 200 ->
-			        if !tc_save = None then begin
-				        (* Remember the current terminal state so we can restore it *)
-				        let tc = Unix.tcgetattr Unix.stdin in
-				        (* Switch into a raw mode, passing through stuff like Control + C *)
-				        let tc' = {
-					        tc with
-						        Unix.c_ignbrk = false;
-						        Unix.c_brkint = false;
-						        Unix.c_parmrk = false;
-						        Unix.c_istrip = false;
-						        Unix.c_inlcr = false;
-						        Unix.c_igncr = false;
-						        Unix.c_icrnl = false;
-						        Unix.c_ixon = false;
-						        Unix.c_opost = false;
-						        Unix.c_echo = false;
-						        Unix.c_echonl = false;
-						        Unix.c_icanon = false;
-						        Unix.c_isig = false;
-						        (* IEXTEN? *)
-						        Unix.c_csize = 8;
-						        Unix.c_parenb = false;
-						        Unix.c_vmin = 0;
-						        Unix.c_vtime = 0;
-				        } in
-				        Unix.tcsetattr Unix.stdin Unix.TCSANOW tc';
-				        tc_save := Some tc
-			        end;
-			        let finished = ref false in
-			        let last_heartbeat = ref (Unix.time ()) in
-			        while not !finished do
-				        if !buf_local_start <> !buf_local_end then begin
-					        let b = Unix.write Unix.stdout buf_local
-						        !buf_local_start (!buf_local_end - !buf_local_start)
-					        in
-					        buf_local_start := !buf_local_start + b;
-					        if !buf_local_start = !buf_local_end then
-						        (buf_local_start := 0; buf_local_end := 0)
-				        end
-				        else if !buf_remote_start <> !buf_remote_end then begin
-					        let b = Unix.write fd buf_remote !buf_remote_start
-						        (!buf_remote_end - !buf_remote_start) in
-					        buf_remote_start := !buf_remote_start + b;
-					        if !buf_remote_start = !buf_remote_end then
-						        (buf_remote_start := 0; buf_remote_end := 0)
-				        end
-				        else if !final then finished := true
-				        else begin
-					        let r, _, _ =
-						        Unix.select [Unix.stdin; fd] [] [] heartbeat_interval in
-					        let now = Unix.time () in
-					        if now  -. !last_heartbeat >= heartbeat_interval then begin
-						        heartbeat_fun ();
-						        last_heartbeat := now
-					        end;
-					        if List.mem Unix.stdin r then begin
-						        let b = Unix.read Unix.stdin buf_remote
-							        !buf_remote_end (block - !buf_remote_end) in
-						        let i = ref !buf_remote_end in
-						        while !i < !buf_remote_end + b && Char.code buf_remote.[!i] <> 0x1d do incr i; done;
-						        if !i < !buf_remote_end + b then final := true;
-						        buf_remote_end := !i
-					        end;
-					        if List.mem fd r then begin
-						        let b = Unix.read fd buf_local
-							        !buf_local_end (block - !buf_local_end) in
-						        buf_local_end := !buf_local_end + b
-					        end
-				        end
-			        done;
-			        marshal ofd (Response OK)
-		      | 404 ->
-			        Printf.fprintf stderr "Server replied with HTTP 404: the console is not available\n";
-			        marshal ofd (Response Failed)
-		      | x ->
-			        Printf.fprintf stderr "Server said: %s" resultline;
-			        marshal ofd (Response Failed)
-		      end in
-	      let delay = ref 0.1 in
-	      let rec keep_connection () =
-		      try
-			      let ic, oc = open_tcp server in
-			      delay := 0.1;
-			      Pervasiveext.finally
-				      (fun () -> connection ic oc)
-				      (fun () -> try close_in ic with _ -> ())
-		      with
-		      | Unix.Unix_error (_, _, _)
-				      when !delay <= long_connection_retry_timeout ->
-			        ignore (Unix.select [] [] [] !delay);
-			        delay := !delay *. 2.;
-				      keep_connection ()
-		      | e ->
-			        prerr_endline (Printexc.to_string e);
-			        marshal ofd (Response Failed) in
-	      keep_connection ();
-	      (match !tc_save with
-	       | Some tc ->
-		         Unix.tcsetattr Unix.stdin Unix.TCSANOW tc;
-		         print_endline "\r"
-	       | None -> ())
+      let server, path = parse_url url in
+      let final = ref false in
+      let tc_save = ref None in
+      let connection c =
+        (* Cohttp doesn't support CONNECT verbs *)
+        let request = Printf.sprintf "CONNECT %s HTTP/1.0\r\ncontent-length: 0\r\n\r\n" path in
+        let buffer = Cstruct.create (String.length request) in
+	Cstruct.blit_from_string request 0 buffer 0 (Cstruct.len buffer);
+	lwt () = c.Channels.really_write buffer in
+        Response.read (Cohttp_unbuffered_io.make_input c) >>= fun r ->
+        begin match r with
+        | None -> fail (Failure "Unable to parse HTTP response from server")
+        | Some x ->
+          let code = Code.code_of_status (Cohttp.Response.status x) in
+          match code with
+	  | 200 ->
+            if !tc_save = None then begin
+              (* Remember the current terminal state so we can restore it *)
+              let tc = Unix.tcgetattr Unix.stdin in
+              (* Switch into a raw mode, passing through stuff like Control + C *)
+              let tc' = { tc with
+                Unix.c_ignbrk = false; c_brkint = false; c_parmrk = false;
+                c_istrip = false; c_inlcr = false; c_igncr = false;
+                c_icrnl = false; c_ixon = false; c_opost = false; c_echo = false;
+                c_echonl = false; c_icanon = false; c_isig = false;
+                (* IEXTEN? *)
+                c_csize = 8; c_parenb = false; c_vmin = 0; c_vtime = 0;
+              } in
+              Unix.tcsetattr Unix.stdin Unix.TCSANOW tc';
+              tc_save := Some tc
+            end;
+            let finished = ref false in
+            lwt () = while_lwt not !finished do
+              (* thread which copies from fd -> stdout *)
+              let t1 =
+                let buffer = Cstruct.create 1024 in
+                lwt stdout = Channels.of_raw_fd Lwt_unix.stdout in
+                while_lwt true do
+                  lwt input = c.Channels.read buffer in
+                  stdout.Channels.really_write input
+                done in
+              (* thread which copies from stdin -> fd *)
+              let t2 =
+                let buffer = Cstruct.create 1024 in
+                lwt stdin = Channels.of_raw_fd Lwt_unix.stdin in
+                while_lwt true do
+                  lwt input = stdin.Channels.read buffer in
+                  (* Look for connection termination request *)
+                  for i = 0 to Cstruct.len input - 1 do
+                    if Cstruct.get_uint8 input i = 0x1d then final := true
+                  done;
+                  c.Channels.really_write input
+                done in
+              (* a thread which periodically sends a heartbeat *)
+              let hb =
+                while_lwt true do
+                  lwt () = Lwt_unix.sleep heartbeat_interval in
+                  heartbeat_fun ()
+                done in
+              lwt () = Lwt.pick [ t1; t2; hb ] in
+              return ()
+           done in
+           marshal control (Response OK)
+         | 302 ->
+           Printf.fprintf stderr "Server replied with HTTP 404: the console is not available\n";
+           marshal control (Response Failed)
+         | _ ->
+           Printf.fprintf stderr "HTTP connection failed\n";
+           marshal control (Response Failed)
+       end in
+     let delay = ref 0.1 in
+     let rec keep_connection () =
+       try_lwt
+         lwt c = open_tcp server in
+         delay := 0.1;
+         try_lwt connection c
+         finally c.Channels.close ()
+       with
+         | Unix.Unix_error (_, _, _) when !delay <= long_connection_retry_timeout ->
+           lwt () = Lwt_unix.sleep !delay in
+           delay := !delay *. 2.;
+           keep_connection ()
+         | e ->
+           prerr_endline (Printexc.to_string e);
+           marshal control (Response Failed) in
+      lwt () = keep_connection () in
+      (match !tc_save with
+      | Some tc ->
+        Unix.tcsetattr Unix.stdin Unix.TCSANOW tc;
+        print_endline "\r";
+        return ();
+      | None -> return ())
     | Command (HttpPut(filename, url)) ->
         begin
-          try
+          try_lwt
             let rec doit url =
-              let (server,path) = parse_url url in
+              let server, path = parse_url url in
               if not (Sys.file_exists filename) then
                 raise (ClientSideError (Printf.sprintf "file '%s' does not exist" filename));
-              let file_ch = open_in_bin filename in
-              let file_size = LargeFile.in_channel_length file_ch in
-              let ic, oc = open_tcp server in
-              debug "PUTting to path [%s]\n%!" path;
-              Printf.fprintf oc "PUT %s HTTP/1.0\r\ncontent-length: %Ld\r\n\r\n" path file_size;
-              flush oc;
-              let resultline = input_line ic in
-              let headers = read_rest_of_headers ic in
-              (* Get the result header immediately *)
-              match http_response_code resultline with
-              | 200 ->
-	              Pervasiveext.finally
-		              (fun () ->
-			              copy_with_heartbeat file_ch oc heartbeat_fun;
-			              marshal ofd (Response OK))
-		              (fun () ->
-			              (try close_in ic with _ -> ());
-			              (try close_in file_ch with _ -> ()))
-              | 302 ->
-	                let newloc = List.assoc "location" headers in
-	                (try close_in ic with _ -> ()); (* Nb. Unix.close_connection only requires the in_channel *)
-                  doit newloc
-              | _ -> failwith "Unhandled response code"
-            in
+              lwt fd = Lwt_unix.openfile filename [ Unix.O_RDONLY ] 0o0 in
+              lwt stats = Lwt_unix.LargeFile.stat filename in
+              let file_size = stats.Lwt_unix.LargeFile.st_size in
+              lwt c = open_tcp server in
+
+              let headers = Header.of_list [ "Content-length", Int64.to_string file_size ] in
+              let request = Cohttp.Request.make ~meth:`PUT ~version:`HTTP_1_0 ~headers (Uri.of_string url) in
+              Request.write (fun t _ -> return ()) request c >>= fun () ->
+              Response.read (Cohttp_unbuffered_io.make_input c) >>= fun r ->
+              begin match r with
+              | None -> fail (Failure "Unable to parse HTTP response from server")
+              | Some x ->
+                let code = Code.code_of_status (Cohttp.Response.status x) in
+                match code with
+                | 200 ->
+                  lwt fd_c = Channels.of_raw_fd fd in
+                  lwt () = copy_with_heartbeat fd_c c heartbeat_fun in
+                  marshal control (Response OK)
+                | 302 ->
+                  let headers = Cohttp.Response.headers x in
+                  begin match Header.get headers "location" with
+                  | Some url ->
+                    lwt () = c.Channels.close () in
+                    doit url
+                  | None ->
+                    failwith "No location in 302 redirect"
+                  end
+                | _ -> failwith "Unhandled response code"
+              end in
             doit url
           with
           | ClientSideError msg ->
-              marshal ofd (Response Failed);
+              lwt () = marshal control (Response Failed) in
               Printf.fprintf stderr "Operation failed. Error: %s\n" msg;
-              exit_code := Some 1
+              exit_code := Some 1;
+              return ()
           | e ->
               debug "HttpPut failure: %s\n%!" (Printexc.to_string e);
               (* Assume the server will figure out what's wrong and tell us over
                  the normal communication channel *)
-              marshal ofd (Response Failed)
+              marshal control (Response Failed)
         end
     | Command (HttpGet(filename, url)) ->
         begin
-          try
+          try_lwt
             let rec doit url =
-              let (server,path) = parse_url url in
+              let server, path = parse_url url in
               debug "Opening connection to server '%s' path '%s'\n%!" server path;
-              let ic, oc = open_tcp server in
-              Printf.fprintf oc "GET %s HTTP/1.0\r\n\r\n" path;
-              flush oc;
-              (* Get the result header immediately *)
-              let resultline = input_line ic in
-              debug "Got %s\n%!" resultline;
-              match http_response_code resultline with
-              | 200 ->
-	                let file_ch =
-		                if filename = "" then
-			                Unix.out_channel_of_descr (Unix.dup Unix.stdout)
-		                else
-			                try open_out_gen [Open_wronly; Open_creat; Open_excl] 0o600 filename
-			                with e -> raise (ClientSideError (Printexc.to_string e))
-	                in
-	                while input_line ic <> "\r" do () done;
-	                Pervasiveext.finally
-		                (fun ()  ->
-			                copy_with_heartbeat ic file_ch heartbeat_fun;
-			                marshal ofd (Response OK))
-		                (fun () ->
-			                (try close_in ic with _ -> ());
-			                (try close_out file_ch with _ -> ()))
-              | 302 ->
-                  let headers = read_rest_of_headers ic in
-                  let newloc = List.assoc "location" headers in
-                  (try close_in ic with _ -> ()); (* Nb. Unix.close_connection only requires the in_channel *)
-                  doit newloc
-              | _ -> failwith "Unhandled response code"
+              lwt c = open_tcp server in
+              let request = Cohttp.Request.make ~meth:`GET ~version:`HTTP_1_0 (Uri.of_string url) in
+              Request.write (fun t _ -> return ()) request c >>= fun () ->
+              Response.read (Cohttp_unbuffered_io.make_input c) >>= fun r ->
+              begin match r with
+              | None -> fail (Failure "Unable to parse HTTP response from server")
+              | Some x ->
+                let code = Code.code_of_status (Cohttp.Response.status x) in
+                match code with
+                | 200 ->
+                  lwt fd =
+                    if filename = ""
+                    then return (Lwt_unix.dup Lwt_unix.stdout)
+                    else Lwt_unix.openfile filename [ Unix.O_WRONLY; Unix.O_EXCL; Unix.O_CREAT ] 0o0600 in
+                  lwt file = Channels.of_raw_fd fd in
+                  try_lwt copy_with_heartbeat c file heartbeat_fun
+                  finally file.Channels.close ()
+                | 302 ->
+                  let headers = Cohttp.Response.headers x in
+                  begin match Header.get headers "location" with
+                  | Some url ->
+                    lwt () = c.Channels.close () in
+                    doit url
+                  | None ->
+                    failwith "No location in 302 redirect"
+                  end
+                | _ -> failwith "Unhandled response code"
+              end
             in
             doit url
           with
           | ClientSideError msg ->
-              marshal ofd (Response Failed);
+              lwt () = marshal control (Response Failed) in
               Printf.fprintf stderr "Operation failed. Error: %s\n" msg;
-              exit_code := Some 1
+              exit_code := Some 1;
+              return ()
           | e ->
               debug "HttpGet failure: %s\n%!" (Printexc.to_string e);
-              marshal ofd (Response Failed)
+              marshal control (Response Failed)
         end
     | Command Prompt ->
         let data = input_line stdin in
-        marshal ofd (Blob (Chunk (Int32.of_int (String.length data))));
-        ignore (Unix.write ofd data 0 (String.length data));
-        marshal ofd (Blob End)
+        lwt () = marshal control (Blob (Chunk (Int32.of_int (String.length data)))) in
+        let buffer = Cstruct.create (String.length data) in
+        Cstruct.blit_from_string data 0 buffer 0 (Cstruct.len buffer);
+        lwt () = control.Channels.really_write buffer in
+        marshal control (Blob End)
     | Command (Error(code, params)) ->
         error "Error code: %s\n" code;
-        error "Error parameters: %s\n" (String.concat ", " params)
+        error "Error parameters: %s\n" (String.concat ", " params);
+        return ()
     | Command (Exit c) ->
-        exit_code := Some c
+        exit_code := Some c;
+        return ()
     | x ->
-        raise (Unexpected_msg x)
-  done;
-  match !exit_code with Some c -> c | _ -> assert false
+        fail (Unexpected_msg x)
+  done in
+  match !exit_code with Some c -> return c | _ -> assert false
 
-let main () =
+let main () : unit Lwt.t =
   let exit_status = ref 1 in
-  let _ =  try
-    Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
-    Sys.set_signal Sys.sigint (Sys.Signal_handle (fun _ -> exit 1));
-    let xe, args =
-      match Array.to_list Sys.argv with
-      | h :: t -> h, t
-      | _ -> assert false in
-    if List.mem "-version" args then begin
-      Printf.printf "ThinCLI protocol: %d.%d\n" major minor;
-      exit 0
-    end;
+  (* Sys.argv has at least one element: the name of the running binary *)
+  let args = List.tl (Array.to_list Sys.argv) in
 
+  if List.mem "-version" args then begin
+    Printf.printf "ThinCLI protocol: %d.%d\n" major minor;
+    exit 0
+  end;
+
+  lwt () = try_lwt
     let args = parse_args args in
 
-    if List.length args < 1 then raise Usage else
-      begin
-        let ic, oc = open_channels () in
-        Printf.fprintf oc "POST /cli HTTP/1.0\r\n";
-        let args = args @ [("username="^ !xapiuname);("password="^ !xapipword)] in
-        let args = String.concat "\n" args in
-        Printf.fprintf oc "User-agent: xe-cli/Unix/%d.%d\r\n" major minor;
-        Printf.fprintf oc "content-length: %d\r\n\r\n" (String.length args);
-        Printf.fprintf oc "%s" args;
-        flush_all ();
+    if List.length args < 1 then fail Usage else begin
 
-        let in_fd = Unix.descr_of_in_channel ic
-        and out_fd = Unix.descr_of_out_channel oc in
-        exit_status := main_loop in_fd out_fd
-      end
+      let body = String.concat "\n" (args @ [("username="^ !xapiuname);("password="^ !xapipword)]) in
+      open_channels () >>= fun c ->
+      let headers = Header.init () in
+      let headers = Header.add headers "User-agent" (Printf.sprintf "xe-cli/Unix/%d.%d" major minor) in
+      let headers = Header.add headers "Content-length" (string_of_int (String.length body)) in
+      let request = Cohttp.Request.make ~meth:`POST ~version:`HTTP_1_0 ~headers (Uri.make ~path:"/cli" ()) in
+      Request.write (fun t _ -> return ()) request c >>= fun () ->
+      Response.read (Cohttp_unbuffered_io.make_input c) >>= fun r ->
+      begin match r with
+      | None -> fail (Failure "Unable to parse HTTP response from server")
+      | Some x ->
+        let code = Code.code_of_status (Cohttp.Response.status x) in
+        if Code.is_success code then begin
+          lwt status = main_loop c in
+          exit_status := status;
+          return ()
+        end else begin
+          exit_status := 1;
+          return ()
+        end
+      end;
+    end
   with
   | Usage ->
       exit_status := 0;
       usage ();
+      return ()
   | Not_a_cli_server ->
       error "Failed to contact a running XenServer management agent.\n";
       error "Try specifying a server name and port.\n";
       usage();
+      return ()
   | Protocol_version_mismatch x ->
       error "Protocol version mismatch: %s.\n" x;
       error "Try specifying a server name and port on the command-line.\n";
       usage();
+      return ()
   | Not_found ->
       error "Host '%s' not found.\n" !xapiserver;
+      return ()
   | Unix.Unix_error(err,fn,arg) ->
-      error "Error: %s (calling %s %s)\n" (Unix.error_message err) fn arg
+      error "Error: %s (calling %s %s)\n" (Unix.error_message err) fn arg;
+      return ()
   | Connect_failure ->
-      error "Unable to contact server. Please check server and port settings.\n"
+      error "Unable to contact server. Please check server and port settings.\n";
+      return ()
   | End_of_file ->
-      error "Lost connection to the server.\n"
+      error "Lost connection to the server.\n";
+      return ()
   | Unexpected_msg m ->
-	  error "Unexpected message from server: %s" (string_of_message m)
+      error "Unexpected message from server: %s" (string_of_message m);
+      return ()
   | Server_internal_error ->
-	  error "Server internal error.\n"
+      error "Server internal error.\n";
+      return ()
   | e ->
-      error "Unhandled exception\n%s\n" (Printexc.to_string e) in
+      error "Unhandled exception\n%s\n" (Printexc.to_string e);
+      return () in
   begin match !debug_file, !debug_channel with
   | Some f, Some ch -> begin
       close_out ch;
@@ -657,4 +634,8 @@ let main () =
   end;
   exit !exit_status
 
-let _ = main ()
+let _ =
+  Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
+  Sys.set_signal Sys.sigint (Sys.Signal_handle (fun _ -> exit 1));
+  let () = Lwt_main.run (main ()) in
+  ()

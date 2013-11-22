@@ -15,6 +15,8 @@
  * @group Command-Line Interface (CLI)
  *)
 
+open Lwt
+
 (** Used to ensure that we actually are talking to a thin CLI server *)
 let major = 0
 let minor = 2
@@ -27,35 +29,35 @@ let prefix = "XenSource thin CLI protocol"
     If the command is "Save" then the server waits for "OK" from the client
     and then streams a list of data chunks to the client. *)
 type command = 
-    | Print of string
-    | Debug of string                     (* debug message to optionally display *)
-    | Load of string                      (* filename *)
-    | HttpGet of string * string          (* filename * path *)
-    | HttpPut of string * string          (* filename * path *)
-	| HttpConnect of string               (* path *)
-    | Prompt                              (* request the user enter some text *) 
-    | Exit of int                         (* exit with a success or failure code *)
-    | Error of string * string list       (* code params *)
-    | PrintStderr of string               (* print something to stderr *)
+  | Print of string
+  | Debug of string                     (* debug message to optionally display *)
+  | Load of string                      (* filename *)
+  | HttpGet of string * string          (* filename * path *)
+  | HttpPut of string * string          (* filename * path *)
+  | HttpConnect of string               (* path *)
+  | Prompt                              (* request the user enter some text *) 
+  | Exit of int                         (* exit with a success or failure code *)
+  | Error of string * string list       (* code params *)
+  | PrintStderr of string               (* print something to stderr *)
 
 (** In response to a server command, the client sends one of these.
     If the command was "Load" or "Prompt" then the client sends a list
     of data chunks. *)
 type response = 
-	| OK
-	| Wait
-	| Failed
+  | OK
+  | Wait
+  | Failed
 
 (** When streaming binary data, send in chunks with a known length and a
     special End marker at the end. *)
 type blob_header = 
-    | Chunk of int32
-    | End
+  | Chunk of int32
+  | End
 
 type message = 
-    | Command of command
-    | Response of response
-    | Blob of blob_header
+  | Command of command
+  | Response of response
+  | Blob of blob_header
 
 (*****************************************************************************)
 (* Pretty-print functions                                                    *)
@@ -73,9 +75,9 @@ let string_of_command = function
   | PrintStderr x            -> "PrintStderr " ^ x
 
 let string_of_response = function
-	| OK      -> "OK"
-	| Wait    -> "Wait"
-	| Failed  -> "Failed"
+  | OK      -> "OK"
+  | Wait    -> "Wait"
+  | Failed  -> "Failed"
 
 let string_of_blob_header = function
   | Chunk x -> "Chunk " ^ (Int32.to_string x)
@@ -90,12 +92,12 @@ let string_of_message = function
 (* Marshal/Unmarshal primitives                                              *)
 
 let marshal_int32 x = 
-  let (>>) a b = Int32.shift_right_logical a b
+  let (lsr) a b = Int32.shift_right_logical a b
   and (&&) a b = Int32.logand a b in
-  let a = (x >> 0) && 0xffl 
-  and b = (x >> 8) && 0xffl
-  and c = (x >> 16) && 0xffl
-  and d = (x >> 24) && 0xffl in
+  let a = (x lsr 0) && 0xffl 
+  and b = (x lsr 8) && 0xffl
+  and c = (x lsr 16) && 0xffl
+  and d = (x lsr 24) && 0xffl in
   let result = String.make 4 '\000' in
   result.[0] <- char_of_int (Int32.to_int a);
   result.[1] <- char_of_int (Int32.to_int b);
@@ -113,13 +115,13 @@ let marshal_list f x =
 type context = string * int (* offset *)
 
 let unmarshal_int32 (s, offset) = 
-  let (<<) a b = Int32.shift_left a b
+  let (lsl) a b = Int32.shift_left a b
   and (||) a b = Int32.logor a b in
   let a = Int32.of_int (int_of_char (s.[offset + 0])) 
   and b = Int32.of_int (int_of_char (s.[offset + 1])) 
   and c = Int32.of_int (int_of_char (s.[offset + 2])) 
   and d = Int32.of_int (int_of_char (s.[offset + 3])) in
-  (a << 0) || (b << 8) || (c << 16) || (d << 24), (s, offset + 4)
+  (a lsl 0) || (b lsl 8) || (c lsl 16) || (d lsl 24), (s, offset + 4)
 
 let unmarshal_int pos = 
   let x, pos = unmarshal_int32 pos in
@@ -184,14 +186,14 @@ let unmarshal_command pos =
     | n -> raise (Unknown_tag("command", n))
 
 let marshal_response = function
-	| OK      -> marshal_int 5
-	| Wait    -> marshal_int 18
+  | OK      -> marshal_int 5
+  | Wait    -> marshal_int 18
   | Failed  -> marshal_int 6
 
 let unmarshal_response pos = 
   let tag, pos = unmarshal_int pos in match tag with
-	  | 5 -> OK, pos
-	  | 18 -> Wait, pos
+    | 5 -> OK, pos
+    | 18 -> Wait, pos
     | 6 -> Failed, pos
     | n -> raise (Unknown_tag("response", n))
 
@@ -210,14 +212,14 @@ let marshal_message = function
   | Response x -> marshal_int 10 ^ (marshal_response x)
   | Blob x     -> marshal_int 11 ^ (marshal_blob_header x) 
 
-let write_string (fd: Unix.file_descr) buf = 
-  Unixext.really_write fd buf 0 (String.length buf)
-
-(** Marshal a message to a file descriptor prefixing it with total header length *)
-let marshal (fd: Unix.file_descr) x = 
+(** Marshal a message to a channel prefixing it with total header length *)
+let marshal c x = 
   let payload = marshal_message x in
-  write_string fd (marshal_int (String.length payload));
-  write_string fd payload
+  let length = marshal_int (String.length payload) in
+  let buffer = Cstruct.create (String.length payload + (String.length length)) in
+  Cstruct.blit_from_string length 0 buffer 0 (String.length length);
+  Cstruct.blit_from_string payload 0 buffer (String.length length) (String.length payload);
+  c.Channels.really_write buffer
 
 exception Unmarshal_failure of exn * string
 
@@ -228,44 +230,44 @@ let unmarshal_message pos =
     | 11 -> let body, pos = unmarshal_blob_header pos in Blob body, pos
     | n -> raise (Unknown_tag("blob_header", n))
 
-(** Unmarshal a message from a file descriptor *)
-let unmarshal (fd: Unix.file_descr) =
-	let buf = Buffer.create 0 in
-	try
-		let head = Unixext.try_read_string ~limit:4 fd in
-		Buffer.add_string buf head;
-		if String.length head < 4 then raise End_of_file;
-		let length, _ = unmarshal_int (head, 0) in
-		let body = Unixext.try_read_string ~limit:length fd in
-		Buffer.add_string buf body;
-		if String.length body < length then raise End_of_file;
-		fst (unmarshal_message (body, 0))
-	with e -> raise (Unmarshal_failure (e, Buffer.contents buf))
+(** Unmarshal a message from a channel *)
+let unmarshal c =
+  try_lwt
+    let length_buffer = Cstruct.create 4 in
+    lwt () = c.Channels.really_read length_buffer in
+    let head = Cstruct.to_string length_buffer in
+    let length, _ = unmarshal_int (head, 0) in
+    let body_buffer = Cstruct.create length in
+    lwt () = c.Channels.really_read body_buffer in
+    let body = Cstruct.to_string body_buffer in
+    return (fst (unmarshal_message (body, 0)) )
+  with e ->
+    fail (Unmarshal_failure (e, "not sure what should go here"))
 
-let marshal_protocol (fd: Unix.file_descr) = 
-  write_string fd (prefix ^ (marshal_int major) ^ (marshal_int minor))
+let marshal_protocol c =
+  let major = marshal_int major in
+  let minor = marshal_int minor in
+  let buffer = Cstruct.create (String.(length prefix + (length major) + (length minor))) in
+  Cstruct.blit_from_string prefix 0 buffer 0 (String.length prefix);
+  Cstruct.blit_from_string major 0 buffer (String.length prefix) (String.length major);
+  Cstruct.blit_from_string minor 0 buffer (String.(length prefix + (length major))) (String.length minor);
+  c.Channels.really_write buffer
 
 exception Protocol_mismatch of string
 exception Not_a_cli_server
 
-let unmarshal_protocol (fd: Unix.file_descr) =
-	let buf = Buffer.create 0 in
-	try
-		let prefix_len = String.length prefix in
-		let prefix' = Unixext.try_read_string ~limit:prefix_len fd in
-		Buffer.add_string buf prefix';
-		if String.length prefix' < prefix_len then raise End_of_file;
-		if prefix' <> prefix then raise Not_a_cli_server;
-		let major_str = Unixext.try_read_string ~limit:4 fd in
-		Buffer.add_string buf major_str;
-		if String.length major_str < 4 then raise End_of_file;
-		let minor_str = Unixext.try_read_string ~limit:4 fd in
-		Buffer.add_string buf minor_str;
-		if String.length minor_str < 4 then raise End_of_file;
-		let major', _ = unmarshal_int (major_str, 0) in
-		let minor', _ = unmarshal_int (minor_str, 0) in
-		major', minor'
-	with e -> raise (Unmarshal_failure (e, Buffer.contents buf))
+let unmarshal_protocol c =
+  try_lwt
+    let buffer = Cstruct.create (String.length prefix + 8) in
+    lwt () = c.Channels.really_read buffer in
+    let prefix' = Cstruct.(to_string (sub buffer 0 (String.length prefix))) in
+    let major_str = Cstruct.(to_string (sub buffer (String.length prefix) 4)) in
+    let minor_str = Cstruct.(to_string (sub buffer (String.length prefix + 4) 4)) in
+    lwt () = if prefix' <> prefix then fail Not_a_cli_server else return () in
+    let major', _ = unmarshal_int (major_str, 0) in
+    let minor', _ = unmarshal_int (minor_str, 0) in
+    return (major', minor')
+  with e -> fail (Unmarshal_failure (e, "what should go here"))
 
 
 (*****************************************************************************)

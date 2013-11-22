@@ -17,7 +17,7 @@
 
 let exnhook = ref None 
 
-let finally fct clean_f =
+let do_finally fct clean_f =
 	let result = try
 		fct ();
 	with

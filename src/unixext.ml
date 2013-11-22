@@ -107,7 +107,7 @@ let lines_iter f = lines_fold (fun () line -> ignore(f line)) ()
 (** open a file, and make sure the close is always done *)
 let with_input_channel file f =
         let input = open_in file in
-        finally
+        do_finally
                 (fun () -> f input)
                 (fun () -> close_in input)
 

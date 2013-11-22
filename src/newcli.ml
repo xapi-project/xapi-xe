@@ -265,12 +265,18 @@ let copy_with_heartbeat in_ch out_ch heartbeat_fun =
         lwt () = out_ch.Channels.really_write input in
         loop () in
     loop () in
+  let request_cancel, _ = Lwt.task () in
   let heartbeat_thread =
     while_lwt true do
-      lwt () = Lwt_unix.sleep heartbeat_interval in
+      lwt () = Lwt.pick [ Lwt_unix.sleep heartbeat_interval; request_cancel ] in
       heartbeat_fun ()
     done in
-  Lwt.pick [ copy_thread; heartbeat_thread ]
+  lwt t = copy_thread in
+  (* We mustn't interrupt the heartbeat_fun since that might
+     leave the channel in a corrupted state *)
+  Lwt.cancel request_cancel;
+  lwt t = try_lwt heartbeat_thread with Lwt.Canceled -> return () in
+  return ()
 
 exception Http_failure
 exception Connect_failure

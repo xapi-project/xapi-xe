@@ -95,19 +95,13 @@ let rec read_rest_of_headers ic =
   | Not_found -> read_rest_of_headers ic
   | _ -> []
 
-let slash = Re_str.regexp_string "/"
-
 let parse_url url =
-  if startswith "https://" url
-  then
-    let stripped = end_of_string url (String.length "https://") in
-    let host, rest =
-      let l = Re_str.split slash stripped in
-      List.hd l, List.tl l in
-    (host,"/" ^ (String.concat "/" rest))
-  else
-    (!xapiserver,url)
-
+  let uri = Uri.of_string url in
+  match Uri.scheme uri, Uri.host uri with
+  | Some "https", Some host ->
+    host, Uri.path uri
+  | _ ->
+    !xapiserver, Uri.path uri
 
 (* Read the password file *)
 let read_pwf () =
@@ -300,7 +294,6 @@ exception Http_failure
 exception Connect_failure
 exception Protocol_version_mismatch of string
 exception ClientSideError of string
-exception Stunnel_exit of int * Unix.process_status
 exception Unexpected_msg of message
 exception Server_internal_error
 
@@ -643,20 +636,12 @@ let main () =
       error "Error: %s (calling %s %s)\n" (Unix.error_message err) fn arg
   | Connect_failure ->
       error "Unable to contact server. Please check server and port settings.\n"
-  | Stunnel.Stunnel_binary_missing ->
-      error "Please install the stunnel package or define the XE_STUNNEL environment variable to point to the binary.\n"
   | End_of_file ->
       error "Lost connection to the server.\n"
   | Unexpected_msg m ->
 	  error "Unexpected message from server: %s" (string_of_message m)
   | Server_internal_error ->
 	  error "Server internal error.\n"
-  | Stunnel_exit (i, e) ->
-      error "Stunnel process %d %s.\n" i
-        (match e with
-         | Unix.WEXITED c -> "existed with exit code " ^ string_of_int c
-         | Unix.WSIGNALED c -> "killed by signal " ^ (Unixext.string_of_signal c)
-         | Unix.WSTOPPED c -> "stopped by signal " ^ string_of_int c)
   | e ->
       error "Unhandled exception\n%s\n" (Printexc.to_string e) in
   begin match !debug_file, !debug_channel with

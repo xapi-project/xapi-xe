@@ -6,6 +6,6 @@ obuild-ver: 1
 executable xe
   main: newcli.ml
   src-dir: src
-  build-deps: uuidm, unix, re.str
+  build-deps: uuidm, unix, re.str, uri
 #  build-deps: xml-light2, stdext, stunnel, xcp
 

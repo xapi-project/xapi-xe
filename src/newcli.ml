@@ -1,5 +1,5 @@
 (*
- * Copyright (C) 2006-2009 Citrix Systems Inc.
+ * Copyright (C) 2006-2013 Citrix Systems Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU Lesser General Public License as published
@@ -11,8 +11,11 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU Lesser General Public License for more details.
  *)
-(* New cli talking to the in-server cli interface *)
-open Stringext
+
+(* Simple CLI which remotes command-lines to xapi, and receives back
+   commands to execute locally (print this string, ask this question,
+   upload this file) *)
+
 open Cli_protocol
 
 (* Param config priorities:
@@ -34,7 +37,6 @@ let xeusessl = ref true
 let xedebug = ref false
 let xedebugonfail = ref false
 
-let stunnel_process = ref None
 let debug_channel = ref None
 let debug_file = ref None
 
@@ -59,6 +61,11 @@ let usage () =
 
 let is_localhost ip = ip = "127.0.0.1"
 
+let startswith prefix x =
+  let prefix' = String.length prefix in
+  let x' = String.length x in
+  x' >= prefix' && (String.sub x 0 prefix' = prefix)
+
 (* HTTP level bits and pieces *)
 
 exception Http_parse_failure
@@ -80,7 +87,7 @@ let rec read_rest_of_headers ic =
     if r="" then [] else
       begin
         debug "read '%s'\n" r;
-        let hdr = List.find (fun s -> String.startswith (s^": ") (String.lowercase r)) hdrs in
+        let hdr = List.find (fun s -> startswith (s^": ") (String.lowercase r)) hdrs in
         let value = end_of_string r (String.length hdr + 2) in
         (hdr,value)::read_rest_of_headers ic
       end
@@ -88,12 +95,14 @@ let rec read_rest_of_headers ic =
   | Not_found -> read_rest_of_headers ic
   | _ -> []
 
+let slash = Re_str.regexp_string "/"
+
 let parse_url url =
-  if String.startswith "https://" url
+  if startswith "https://" url
   then
     let stripped = end_of_string url (String.length "https://") in
     let host, rest =
-      let l =  String.split '/' stripped in
+      let l = Re_str.split slash stripped in
       List.hd l, List.tl l in
     (host,"/" ^ (String.concat "/" rest))
   else
@@ -123,6 +132,23 @@ let parse_port (x: string) =
   with _ ->
     error "Port number must be an integer (0-65535)\n";
     raise Usage
+
+let filter_chars s valid =
+        let badchars = ref false in
+        let buf = Buffer.create 0 in
+        for i = 0 to String.length s - 1
+        do
+                if !badchars then (
+                        if valid s.[i] then
+                                Buffer.add_char buf s.[i]
+                ) else (
+                        if not (valid s.[i]) then (
+                                Buffer.add_substring buf s 0 i;
+                                badchars := true
+                        )
+                )
+        done;
+        if !badchars then Buffer.contents buf else s
 
 (* Extract the arguments we're interested in. Return a list of the argumets we know *)
 (* nothing about. These will get passed straight into the server *)
@@ -203,7 +229,7 @@ let parse_args =
           if !i >= String.length extra_args
             || extra_args.[!i] = ',' && extra_args.[!i-1] <> '\\' then
               (let seg = String.sub extra_args !pos (!i - !pos) in
-               l := String.filter_chars seg ((<>) '\\') :: !l;
+               l := filter_chars seg ((<>) '\\') :: !l;
                incr i; pos := !i)
           else incr i
       done;
@@ -225,14 +251,7 @@ let parse_args =
     args_rest @ extras_rest @ rcs_rest @ !reserve_args
 
 let open_tcp_ssl server =
-  let port = get_xapiport true in
-  debug "Connecting via stunnel to [%s] port [%d]\n%!" server port;
-  (* We don't bother closing fds since this requires our close_and_exec wrapper *)
-  let x = Stunnel.connect ~use_fork_exec_helper:false
-    ~write_to_log:(fun x -> debug "stunnel: %s\n%!" x)
-    ~extended_diagnosis:(!debug_file <> None) server port in
-  if !stunnel_process = None then stunnel_process := Some x;
-  Unix.in_channel_of_descr x.Stunnel.fd, Unix.out_channel_of_descr x.Stunnel.fd
+  failwith "ssl not implemented"
 
 let open_tcp server =
   if !xeusessl && not(is_localhost server) then (* never use SSL on-host *)
@@ -252,7 +271,9 @@ let open_channels () =
   ) else
     open_tcp !xapiserver
 
-let http_response_code x = match String.split ' ' x with
+let space = Re_str.regexp_string " "
+
+let http_response_code x = match Re_str.split space x with
   | _ :: code :: _ -> int_of_string code
   | _ -> failwith "Bad response from HTTP server"
 
@@ -316,14 +337,7 @@ let main_loop ifd ofd =
     *)
     while (match Unix.select [ifd] [] [] 5.0 with
            | _ :: _, _, _ -> false
-           | _ ->
-               match !stunnel_process with
-               | Some {Stunnel.pid = pid} -> begin
-                   match Unix.waitpid [Unix.WNOHANG] pid with
-                   | 0, _ -> true
-                   | i, e -> raise (Stunnel_exit (i, e))
-                 end
-               | _ -> true) do ()
+           | _ -> true) do ()
     done;
 	  let cmd =
 		  try unmarshal ifd
@@ -645,19 +659,6 @@ let main () =
          | Unix.WSTOPPED c -> "stopped by signal " ^ string_of_int c)
   | e ->
       error "Unhandled exception\n%s\n" (Printexc.to_string e) in
-  begin match !stunnel_process with
-  | Some p ->
-      if Sys.file_exists p.Stunnel.logfile then
-        begin
-          if !exit_status <> 0 then
-            (debug "\nStunnel diagnosis:\n\n";
-             try Stunnel.diagnose_failure p
-             with e -> debug "%s\n" (Printexc.to_string e));
-          try Unix.unlink p.Stunnel.logfile with _ -> ()
-        end;
-      Stunnel.disconnect ~wait:false ~force:true p
-  | None -> ()
-  end;
   begin match !debug_file, !debug_channel with
   | Some f, Some ch -> begin
       close_out ch;

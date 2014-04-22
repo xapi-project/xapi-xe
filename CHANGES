@@ -3,3 +3,4 @@ trunk (unreleased)
 * Now links against libssl directly (via Lwt_ssl) rather than using
   stunnel
 * Update to cohttp 0.10.0
+* Replace 'obuild' with 'oasis'

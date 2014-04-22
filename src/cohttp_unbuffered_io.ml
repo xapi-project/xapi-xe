@@ -41,6 +41,8 @@ let make_input c =
 
 type oc = Channels.t
 
+let flush _ = return ()
+
 let really_read_into c buf ofs len =
   let tmp = Cstruct.create len in
   c.Channels.really_read tmp >>= fun () ->

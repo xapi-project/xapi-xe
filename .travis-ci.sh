@@ -1,5 +1,5 @@
 # OPAM packages needed to build tests.
-OPAM_PACKAGES="uuidm re uri cohttp ssl lwt cstruct"
+OPAM_PACKAGES="uuidm re uri cohttp ssl lwt cstruct oasis"
 
 
 case "$OCAML_VERSION,$OPAM_VERSION" in

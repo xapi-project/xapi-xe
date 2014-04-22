@@ -359,8 +359,9 @@ let main_loop control =
 	lwt () = c.Channels.really_write buffer in
         Response.read (Cohttp_unbuffered_io.make_input c) >>= fun r ->
         begin match r with
-        | None -> fail (Failure "Unable to parse HTTP response from server")
-        | Some x ->
+        | `Invalid x -> fail (Failure ("Unable to parse HTTP response from server: " ^ x))
+        | `Eof -> fail (Failure "Connection closed prematurely while parsing HTTP response from server.")
+        | `Ok x ->
           let code = Code.code_of_status (Cohttp.Response.status x) in
           match code with
 	  | 200 ->
@@ -459,8 +460,9 @@ let main_loop control =
               Request.write (fun t _ -> return ()) request c >>= fun () ->
               Response.read (Cohttp_unbuffered_io.make_input c) >>= fun r ->
               begin match r with
-              | None -> fail (Failure "Unable to parse HTTP response from server")
-              | Some x ->
+              | `Invalid x -> fail (Failure ("Unable to parse HTTP response from server" ^ x))
+              | `Eof -> fail (Failure "Connection closed prematurely when parsing HTTP response")
+              | `Ok x ->
                 let code = Code.code_of_status (Cohttp.Response.status x) in
                 match code with
                 | 200 ->
@@ -507,8 +509,9 @@ let main_loop control =
               Request.write (fun t _ -> return ()) request c >>= fun () ->
               Response.read (Cohttp_unbuffered_io.make_input c) >>= fun r ->
               begin match r with
-              | None -> fail (Failure "Unable to parse HTTP response from server")
-              | Some x ->
+              | `Invalid x -> fail (Failure ("Unable to parse HTTP response from server: " ^ x))
+              | `Eof -> fail (Failure "Connection closed prematurely when parsing HTTP response")
+              | `Ok x ->
                 let code = Code.code_of_status (Cohttp.Response.status x) in
                 match code with
                 | 200 ->

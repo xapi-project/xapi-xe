@@ -1,0 +1,17 @@
+OASISFormat: 0.3
+Name:        xe
+Version:     0.6.0
+Synopsis:    A simple command-line interface for xapi
+Authors:     David Scott
+License:     Apache
+Plugins:     META (0.3)
+BuildTools:  ocamlbuild
+
+Executable xe
+  CompiledObject:     best
+  Path:               src
+  MainIs:             newcli.ml
+  Custom:             true
+  Install:            false
+  BuildDepends:       uuidm, unix, re.str, uri, cohttp, cohttp.lwt, lwt, lwt.unix, lwt.ssl, lwt.syntax, cstruct
+

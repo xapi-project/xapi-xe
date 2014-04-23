@@ -6,9 +6,6 @@ build: setup.data
 setup.data: setup.ml
 	ocaml setup.ml -configure
 
-setup.ml: _oasis
-	oasis setup
-
 .PHONY: install
 install: build
 	mkdir -p ${BINDIR}

@@ -1,4 +1,4 @@
-trunk (unreleased)
+0.6.1 (2014-04-23)
 * Add version constraints in _oasis on cstruct >= 0.6.0 and cohttp >= 0.10.0
 
 0.6.0 (2014-04-22)

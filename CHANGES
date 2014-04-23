@@ -1,5 +1,6 @@
-0.6.1 (2014-04-23)
+0.6.2 (2014-04-23)
 * Add version constraints in _oasis on cstruct >= 0.6.0 and cohttp >= 0.10.0
+* Remove Makefile rule which runs 'oasis setup': it will be done manually
 
 0.6.0 (2014-04-22)
 * Initial import from xen-api c/s 11db05966a1e79275405a089e4221d208bc2778b 

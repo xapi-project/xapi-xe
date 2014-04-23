@@ -13,5 +13,5 @@ Executable xe
   MainIs:             newcli.ml
   Custom:             true
   Install:            false
-  BuildDepends:       uuidm, unix, re.str, uri, cohttp, cohttp.lwt, lwt, lwt.unix, lwt.ssl, lwt.syntax, cstruct
+  BuildDepends:       uuidm, unix, re.str, uri, cohttp (>= 0.10.0), cohttp.lwt, lwt, lwt.unix, lwt.ssl, lwt.syntax, cstruct (>= 0.6.0)
 

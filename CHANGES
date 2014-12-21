@@ -1,5 +1,6 @@
-trunk (unreleased)
-* Add version constraints in _oasis on cstruct >= 0.6.0 and cohttp >= 0.10.0
+0.7.0 (2014-12-21)
+* Add version constraints in _oasis on cstruct >= 0.6.0 and cohttp >= 0.14.0
+* Update to cohttp 0.14.0+
 
 0.6.0 (2014-04-22)
 * Initial import from xen-api c/s 11db05966a1e79275405a089e4221d208bc2778b 

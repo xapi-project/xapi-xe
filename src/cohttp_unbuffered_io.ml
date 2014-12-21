@@ -22,6 +22,7 @@ let iter fn x = Lwt_list.iter_s fn x
 let return = Lwt.return
 let (>>=) = Lwt.bind
 let (>>) m n = m >>= fun _ -> n
+type conn = unit
 
 (** Use as few really_{read,write} calls as we can (for efficiency) without
     explicitly buffering the stream beyond the HTTP headers. This will

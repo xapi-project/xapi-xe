@@ -454,10 +454,9 @@ let main_loop control =
               lwt stats = Lwt_unix.LargeFile.stat filename in
               let file_size = stats.Lwt_unix.LargeFile.st_size in
               lwt c = open_tcp server in
-
               let headers = Header.of_list [ "content-length", Int64.to_string file_size ] in
               let request = Cohttp.Request.make ~meth:`PUT ~version:`HTTP_1_0 ~headers (Uri.of_string url) in
-              Request.write (fun t _ -> return ()) request c >>= fun () ->
+              Request.write (fun writer -> return_unit) request c >>= fun () ->
               Response.read (Cohttp_unbuffered_io.make_input c) >>= fun r ->
               begin match r with
               | `Invalid x -> fail (Failure ("Unable to parse HTTP response from server" ^ x))
@@ -506,7 +505,7 @@ let main_loop control =
               debug "Opening connection to server '%s' path '%s'\n%!" server path;
               lwt c = open_tcp server in
               let request = Cohttp.Request.make ~meth:`GET ~version:`HTTP_1_0 (Uri.of_string url) in
-              Request.write (fun t _ -> return ()) request c >>= fun () ->
+              Request.write (fun _ -> return_unit) request c >>= fun () ->
               Response.read (Cohttp_unbuffered_io.make_input c) >>= fun r ->
               begin match r with
               | `Invalid x -> fail (Failure ("Unable to parse HTTP response from server: " ^ x))
@@ -586,7 +585,7 @@ let main () : unit Lwt.t =
       let headers = Header.add headers "User-agent" (Printf.sprintf "xe-cli/Unix/%d.%d" major minor) in
       let headers = Header.add headers "content-length" (string_of_int (String.length body)) in
       let request = Cohttp.Request.make ~meth:`POST ~version:`HTTP_1_0 ~headers (Uri.make ~path:"/cli" ()) in
-      Request.write (fun t oc -> Request.write_body t oc body) request c >>= fun () ->
+      Request.write (fun wr -> Request.write_body wr body) request c >>= fun () ->
       (* NB: there is no HTTP response normally *)
       lwt status = main_loop c in
       exit_status := status;

@@ -124,7 +124,7 @@ let sslctx legacy ciphers =
 
 (* The first call to this sets up the TLS configuration, then in
  * any subsequent calls fd is the only parameter that is used. *)
-let of_ssl_fd ~legacy ?ciphers fd =
+let of_ssl_fd ~legacy ~ciphers fd =
   let really_write_offset = ref 0L in
   Lwt_ssl.ssl_connect fd (sslctx legacy ciphers) >>= fun sock ->
   let read buf =

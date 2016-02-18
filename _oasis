@@ -1,6 +1,6 @@
 OASISFormat: 0.3
 Name:        xe
-Version:     0.7.0
+Version:     0.8.0
 Synopsis:    A simple command-line interface for xapi
 Authors:     David Scott
 License:     Apache

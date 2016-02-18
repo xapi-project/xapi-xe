@@ -101,8 +101,10 @@ let gen_sslctx legacy ciphers =
      * for this function says, "Note that [SSLv23] disables both SSLv2 and
      * SSLv3 (as opposed to all the protocols)."
      *)
-    (* Disable SSL v2 and v3, and TLSv1.1, leaving only TLSv1.0 and TLSv1.2 *)
-    Ssl.disable_protocols ctx [Ssl.SSLv23; Ssl.TLSv1_1];
+    (* Disable SSL v2 and v3, leaving only TLSv1.0 and TLSv1.1 and TLSv1.2 *)
+    (* We don't need 1.1, but if we add it to the list then 1.2 gets disabled
+     * too: a bug in the Ssl module v0.5.2 (or the libssl it is using) *)
+    Ssl.disable_protocols ctx [Ssl.SSLv23];
   );
   Ssl.set_cipher_list ctx (match ciphers with
     | Some c -> c

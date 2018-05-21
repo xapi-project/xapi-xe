@@ -234,7 +234,12 @@ let open_tcp_ssl host =
   Lwt_unix.gethostbyname host >>= fun host_entry ->
   let sockaddr = Lwt_unix.ADDR_INET(host_entry.Lwt_unix.h_addr_list.(0), get_xapiport true) in
   let sock = socket sockaddr in
-  Lwt_unix.connect sock sockaddr >>= fun () ->
+  Lwt.catch (fun () ->
+      Lwt_unix.connect sock sockaddr
+    ) (fun e ->
+      Lwt_unix.close sock >>= Lwt.fail e
+    )
+  >>= fun () ->
   Channels.of_ssl_fd ~legacy:!allow_ssl_legacy ~ciphers:!ciphersuites sock
 
 let open_tcp host =
@@ -244,7 +249,12 @@ let open_tcp host =
     Lwt_unix.gethostbyname host >>= fun host_entry ->
     let sockaddr = Lwt_unix.ADDR_INET(host_entry.Lwt_unix.h_addr_list.(0), get_xapiport false) in
     let sock = socket sockaddr in
-    Lwt_unix.connect sock sockaddr >>= fun () ->
+    Lwt.catch (fun () ->
+        Lwt_unix.connect sock sockaddr
+      ) (fun e ->
+        Lwt_unix.close sock >>= Lwt.fail e
+      )
+    >>= fun () ->
     Channels.of_raw_fd sock
   end
 
@@ -253,7 +263,12 @@ let open_channels () =
     try_lwt
       let sockaddr = Lwt_unix.ADDR_UNIX (Filename.concat "/var/lib/xcp" "xapi") in
       let sock = socket sockaddr in
-      Lwt_unix.connect sock sockaddr >>= fun () ->
+      Lwt.catch (fun () ->
+          Lwt_unix.connect sock sockaddr
+        ) (fun e ->
+          Lwt_unix.close sock >>= Lwt.fail e
+        )
+      >>= fun () ->
       Channels.of_raw_fd sock
     with _ ->
       open_tcp !xapiserver
